@@ -6,6 +6,7 @@ from urllib.parse import urljoin
 
 
 def get_company_list():
+    """Scrape company listings from DSE website and return structured data."""
     url = "https://www.dsebd.org/company_listing.php"
     try:
         # Send HTTP request
@@ -36,32 +37,43 @@ def get_company_list():
 
 def scrape_company_data(company_data):
     url = company_data['href']
-    response = requests.get(url)
-    soup = BeautifulSoup(response.text, 'html.parser')
+    VALID_HEADERS = [
+        'Closing Price',
+        "Day's Value (mn)",
+        "Day's Volume (Nos.)",
+        'Total No. of Outstanding Securities'
+    ]
+    if not url:
+        return {}
+    try:
+        response = requests.get(url)
+        soup = BeautifulSoup(response.text, 'html.parser')
 
-    # Find the table with company information (adjust selector as needed)
-    table = soup.find_all('div', class_='table-responsive')
-    c = []
-    data = []
-    for index, body_div in enumerate(table, 1):
-        current_section = {}
-        for element in body_div.find_all(['th', 'td']):
-            c.append(element)
-            if element.name == 'th':
-                current_header = element.get_text(strip=True) if element.get_text(strip=True) in ['Closing Price',
-                                                                                                  'Day\'s Value (mn)',
-                                                                                                  'Day\'s Volume (Nos.)',
-                                                                                                  'Total No. of Outstanding Securities'] else None
-            elif element.name == 'td' and current_header:
-                current_section[current_header] = element.get_text(strip=True)
-                # current_section[current_header].append(element.get_text(strip=True))
-                current_header = None
-        if current_section:
-            data.append(current_section)
-        combined_dict = {}
-        for item in data:
-            combined_dict.update(item)
-    return combined_dict
+        # Find the table with company information (adjust selector as needed)
+        table = soup.find_all('div', class_='table-responsive')
+        c = []
+        data = []
+        for index, body_div in enumerate(table, 1):
+            current_section = {}
+            for element in body_div.find_all(['th', 'td']):
+                c.append(element)
+                if element.name == 'th':
+                    current_header = element.get_text(strip=True)
+                    current_header = current_header if current_header in VALID_HEADERS else None
+                elif element.name == 'td' and current_header:
+                    current_section[current_header] = element.get_text(strip=True)
+                    current_header = None
+            if current_section:
+                data.append(current_section)
+            combined_dict = {}
+            for item in data:
+                combined_dict.update(item)
+        return combined_dict
+    except Exception as e:
+        print(f"Error scraping data for {company_data.get('title', 'Unknown')}: {str(e)}")
+        return {}
+
+
 
 
 def save_to_csv(data, filename="scraped_data.csv"):
