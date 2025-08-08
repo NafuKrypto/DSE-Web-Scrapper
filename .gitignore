@@ -1,0 +1,10 @@
+# PyCharm/IntelliJ IDEA files
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Temporary files
+*.~lock.*
+*.swp
+*.bak
