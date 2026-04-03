@@ -100,7 +100,9 @@ def save_to_csv(data, filename="scraped_data.csv"):
 def save_to_sheets(data):
     # Auth setup
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    info = json.loads(os.environ.get("GOOGLE_CREDENTIALS"))
+    # creds = ServiceAccountCredentials.from_json_keyfile_name(info, scope)
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
     client = gspread.authorize(creds)
 
     # Open your sheet (Change 'DSE_Data' to your sheet name)
