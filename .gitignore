@@ -8,3 +8,13 @@
 *.~lock.*
 *.swp
 *.bak
+
+credentials.json
+*.csv
+
+# Python specific
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env

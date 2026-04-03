@@ -3,6 +3,12 @@ import csv
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+from fastapi import FastAPI
+
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
+app = FastAPI()
 
 
 def get_company_list():
@@ -74,8 +80,6 @@ def scrape_company_data(company_data):
         return {}
 
 
-
-
 def save_to_csv(data, filename="scraped_data.csv"):
     fieldnames = [
         'Company',
@@ -93,8 +97,37 @@ def save_to_csv(data, filename="scraped_data.csv"):
             writer.writerow(row)  # Write all rows
 
 
+def save_to_sheets(data):
+    # Auth setup
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    client = gspread.authorize(creds)
+
+    # Open your sheet (Change 'DSE_Data' to your sheet name)
+    sheet = client.open("DSE_Data").sheet1
+
+    # Prepare data for batch update (Headers + Rows)
+    headers = ['Company', 'Closing Price', "Day's Value (mn)", "Day's Volume (Nos.)",
+               'Total No. of Outstanding Securities']
+    rows = [headers]
+
+    for company, values in data.items():
+        rows.append([
+            company,
+            values.get('Closing Price', ''),
+            values.get("Day's Value (mn)", ''),
+            values.get("Day's Volume (Nos.)", ''),
+            values.get('Total No. of Outstanding Securities', '')
+        ])
+
+    # Clear old data and update with new
+    sheet.clear()
+    sheet.update(rows, 'A1')
+
+
 # Press the green button in the gutter to run the script.
-if __name__ == '__main__':
+@app.get("/execute")
+def execute_logic():
     company_list_data = get_company_list()
     final_data_companies = {}
     # for test
@@ -105,4 +138,12 @@ if __name__ == '__main__':
         data = scrape_company_data(company)
         final_data_companies[company['title']] = data
         print("Data processing ended for : ", company['title'])
-    save_to_csv(final_data_companies, 'DSE_COMPANIES_LIST.csv')
+    # save_to_csv(final_data_companies, 'DSE_COMPANIES_LIST.csv')
+    save_to_sheets(final_data_companies)
+    return {"status": "success", "detail": "Logic executed from Google Sheets"}
+
+
+@app.get("/")
+def health_check():
+    # Render uses this to see if the app is 'Live'
+    return {"status": "active", "message": "FastAPI is running"}
