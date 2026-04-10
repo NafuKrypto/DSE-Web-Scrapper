@@ -1,7 +1,12 @@
+import asyncio
+import aiohttp
+import json
+import os
 import csv
+import io
 
-import requests
 from bs4 import BeautifulSoup
+from fastapi.responses import StreamingResponse, FileResponse
 from urllib.parse import urljoin
 from fastapi import FastAPI
 
@@ -10,74 +15,142 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 app = FastAPI()
 
+# --- Config ---
+MAX_CONCURRENT = 50  # simultaneous connections (tune as needed)
+REQUEST_TIMEOUT = 15  # seconds per request
+RETRY_ATTEMPTS = 3  # retries on failure
 
-def get_company_list():
-    """Scrape company listings from DSE website and return structured data."""
+VALID_HEADERS = [
+    'Closing Price',
+    "Day's Value (mn)",
+    "Day's Volume (Nos.)",
+    'Total No. of Outstanding Securities'
+]
+
+
+# ──────────────────────────────────────────────
+# 1. Scrape company list (one-time, sync is fine)
+# ──────────────────────────────────────────────
+def get_company_list() -> list[dict]:
+    """Scrape all company links from DSE listing page."""
+    import requests
     url = "https://www.dsebd.org/company_listing.php"
     try:
-        # Send HTTP request
-        response = requests.get(url)
-        response.raise_for_status()  # Raise exception for bad status codes
-
-        # Parse HTML content
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
 
-        all_body_contents = soup.find_all('div', class_='BodyContent')
-
-        # 3. Extract all <a> tags from each BodyContent div
-        company_data_lists = []
-        for index, body_div in enumerate(all_body_contents, 1):
+        companies = []
+        for body_div in soup.find_all('div', class_='BodyContent'):
             for a_tag in body_div.find_all('a', href=True):
-                link = {
+                companies.append({
                     'title': a_tag.get_text(strip=True),
-                    'href': urljoin(url, a_tag['href']),  # Convert to absolute URL
-                    'link_text': ' '.join(a_tag.get_text().split()),  # Cleaned text
-                }
-                company_data_lists.append(link)
-        return company_data_lists
+                    'href': urljoin(url, a_tag['href']),
+                })
+        print(f"[+] Found {len(companies)} companies to scrape.")
+        return companies
 
     except Exception as e:
-        print(f"Error scraping company list: {str(e)}")
-        return []  # Return empty list if scraping fails
+        print(f"[!] Failed to fetch company list: {e}")
+        return []
 
 
-def scrape_company_data(company_data):
-    url = company_data['href']
-    VALID_HEADERS = [
+# ──────────────────────────────────────────────
+# 2. Async scrape a single company page
+# ──────────────────────────────────────────────
+async def scrape_company_async(
+        session: aiohttp.ClientSession,
+        semaphore: asyncio.Semaphore,
+        company: dict,
+) -> tuple[str, dict]:
+    """Fetch and parse a single company page. Returns (title, data_dict)."""
+    title = company['title']
+    url = company['href']
+
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            async with semaphore:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
+                    resp.raise_for_status()
+                    html = await resp.text()
+
+            soup = BeautifulSoup(html, 'html.parser')
+            combined = {}
+            current_header = None
+
+            for body_div in soup.find_all('div', class_='table-responsive'):
+                for element in body_div.find_all(['th', 'td']):
+                    if element.name == 'th':
+                        text = element.get_text(strip=True)
+                        current_header = text if text in VALID_HEADERS else None
+                    elif element.name == 'td' and current_header:
+                        combined[current_header] = element.get_text(strip=True)
+                        current_header = None
+
+            print(f"  [✓] {title}")
+            return title, combined
+
+        except Exception as e:
+            if attempt < RETRY_ATTEMPTS:
+                await asyncio.sleep(2 ** attempt)  # exponential back-off
+            else:
+                print(f"  [✗] {title} failed after {RETRY_ATTEMPTS} attempts: {e}")
+                return title, {}
+
+
+# ──────────────────────────────────────────────
+# 3. Run all scrapes concurrently
+# ──────────────────────────────────────────────
+async def scrape_all(companies: list[dict]) -> dict:
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT, ssl=False)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            scrape_company_async(session, semaphore, company)
+            for company in companies
+        ]
+        results = await asyncio.gather(*tasks)
+
+    return {title: data for title, data in results}
+
+
+# ──────────────────────────────────────────────
+# 4. Save to Google Sheets (batch update)
+# ──────────────────────────────────────────────
+def save_to_sheets(data: dict):
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
+    client = gspread.authorize(creds)
+
+    sheet = client.open("DSE_Data").sheet1
+
+    headers = [
+        'Company',
         'Closing Price',
         "Day's Value (mn)",
         "Day's Volume (Nos.)",
-        'Total No. of Outstanding Securities'
+        'Total No. of Outstanding Securities',
     ]
-    if not url:
-        return {}
-    try:
-        response = requests.get(url)
-        soup = BeautifulSoup(response.text, 'html.parser')
+    rows = [headers] + [
+        [
+            company,
+            values.get('Closing Price', ''),
+            values.get("Day's Value (mn)", ''),
+            values.get("Day's Volume (Nos.)", ''),
+            values.get('Total No. of Outstanding Securities', ''),
+        ]
+        for company, values in data.items()
+    ]
 
-        # Find the table with company information (adjust selector as needed)
-        table = soup.find_all('div', class_='table-responsive')
-        c = []
-        data = []
-        for index, body_div in enumerate(table, 1):
-            current_section = {}
-            for element in body_div.find_all(['th', 'td']):
-                c.append(element)
-                if element.name == 'th':
-                    current_header = element.get_text(strip=True)
-                    current_header = current_header if current_header in VALID_HEADERS else None
-                elif element.name == 'td' and current_header:
-                    current_section[current_header] = element.get_text(strip=True)
-                    current_header = None
-            if current_section:
-                data.append(current_section)
-            combined_dict = {}
-            for item in data:
-                combined_dict.update(item)
-        return combined_dict
-    except Exception as e:
-        print(f"Error scraping data for {company_data.get('title', 'Unknown')}: {str(e)}")
-        return {}
+    sheet.clear()
+    # batch_update writes everything in ONE API call — much faster than row-by-row
+    sheet.update(rows, 'A1')
+    print(f"[+] Google Sheet updated with {len(rows) - 1} companies.")
 
 
 def save_to_csv(data, filename="scraped_data.csv"):
@@ -94,58 +167,95 @@ def save_to_csv(data, filename="scraped_data.csv"):
         for company, values in data.items():
             row = {'Company': company}
             row.update(values)
-            writer.writerow(row)  # Write all rows
+            writer.writerow(row)
 
 
-def save_to_sheets(data):
-    # Auth setup
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    info = json.loads(os.environ.get("GOOGLE_CREDENTIALS"))
-    # creds = ServiceAccountCredentials.from_json_keyfile_name(info, scope)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
-    client = gspread.authorize(creds)
+def generate_csv_response(data: dict):
+    """Generates an in-memory CSV and returns a FastAPI StreamingResponse."""
+    fieldnames = [
+        'Company',
+        'Closing Price',
+        "Day's Value (mn)",
+        "Day's Volume (Nos.)",
+        'Total No. of Outstanding Securities'
+    ]
 
-    # Open your sheet (Change 'DSE_Data' to your sheet name)
-    sheet = client.open("DSE_Data").sheet1
+    # Create an in-memory string buffer
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
 
-    # Prepare data for batch update (Headers + Rows)
-    headers = ['Company', 'Closing Price', "Day's Value (mn)", "Day's Volume (Nos.)",
-               'Total No. of Outstanding Securities']
-    rows = [headers]
-
+    writer.writeheader()
     for company, values in data.items():
-        rows.append([
-            company,
-            values.get('Closing Price', ''),
-            values.get("Day's Value (mn)", ''),
-            values.get("Day's Volume (Nos.)", ''),
-            values.get('Total No. of Outstanding Securities', '')
-        ])
+        # Ensure we only include keys that are in fieldnames to avoid errors
+        row = {'Company': company}
+        for field in fieldnames[1:]:
+            row[field] = values.get(field, '')
+        writer.writerow(row)
 
-    # Clear old data and update with new
-    sheet.clear()
-    sheet.update(rows, 'A1')
+    # Fetch the content and seek to 0 is not needed if we use getvalue()
+    # But for StreamingResponse, we wrap it in an iterator
+    csv_content = output.getvalue()
+    output.close()
+
+    return StreamingResponse(
+        io.BytesIO(csv_content.encode("utf-8")),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=dse_scraped_data.csv"
+        }
+    )
 
 
-# Press the green button in the gutter to run the script.
+# ──────────────────────────────────────────────
+# 5. FastAPI endpoints
+# ──────────────────────────────────────────────
 @app.get("/execute")
-def execute_logic():
-    company_list_data = get_company_list()
-    final_data_companies = {}
-    # for test
-    # temp = company_list_data[:10]
-    print("Total Number of Company to scrape : ", len(company_list_data))
-    for company in company_list_data:
-        print("Data processing start for : ", company['title'])
-        data = scrape_company_data(company)
-        final_data_companies[company['title']] = data
-        print("Data processing ended for : ", company['title'])
-    # save_to_csv(final_data_companies, 'DSE_COMPANIES_LIST.csv')
-    save_to_sheets(final_data_companies)
-    return {"status": "success", "detail": "Logic executed from Google Sheets"}
+async def execute_logic():  # ← async endpoint
+    companies = get_company_list()
+    if not companies:
+        return {"status": "error", "detail": "Could not fetch company list"}
+
+    final_data = await scrape_all(companies)  # concurrent scraping
+    # save_to_csv(final_data)
+    # save_to_sheets(final_data)
+    return generate_csv_response(final_data)
+    # return {
+    #     "status": "success",
+    #     "companies_scraped": len(final_data),
+    #     "detail": "Data saved to Google Sheets",
+    # }
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "active", "message": "FastAPI is running"}
 
 
 @app.get("/")
-def health_check():
-    # Render uses this to see if the app is 'Live'
-    return {"status": "active", "message": "FastAPI is running"}
+def main_page():
+    # This serves the index.html file you just created
+    return FileResponse("index.html")
+
+
+@app.get("/execute-live")
+async def execute_live():
+    async def event_generator():
+        companies = get_company_list()
+        yield f"data: Found {len(companies)} companies. Starting...\n\n"
+
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+        connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT, ssl=False)
+
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # We use as_completed to yield names IMMEDIATELY as they finish
+            tasks = [scrape_company_async(session, semaphore, c) for c in companies[:30]]  # Limit for test
+
+            for task in asyncio.as_completed(tasks):
+                title, _ = await task
+                if title:
+                    yield f"data: {title}\n\n"
+
+        # CRITICAL: This exact string tells the JS to stop the spinner
+        yield "data: FINISHED_ALL\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
