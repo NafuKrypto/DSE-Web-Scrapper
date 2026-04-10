@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DSE Scraper</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 min-h-screen flex flex-col items-center py-12">
+
+    <div class="bg-white p-8 rounded-lg shadow-md w-full max-w-2xl">
+        <h1 class="text-2xl font-bold mb-6 text-gray-800">DSE Data Scraper</h1>
+
+        <button id="startBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-6 rounded transition duration-200">
+            Start Scraping
+        </button>
+
+        <div id="statusSection" class="mt-8 hidden">
+            <div class="flex items-center space-x-3 mb-4">
+                <div class="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div>
+                <p class="text-gray-600 font-medium">Scraping in progress...</p>
+            </div>
+
+            <div id="log" class="bg-gray-900 text-green-400 p-4 rounded text-sm font-mono h-48 overflow-y-auto">
+                > System ready...
+            </div>
+        </div>
+
+        <div id="successMsg" class="mt-6 hidden p-4 bg-green-100 text-green-700 rounded border border-green-200">
+            ✅ Successfully scraped data! Your download should start automatically.
+        </div>
+    </div>
+
+   <script>
+    const startBtn = document.getElementById('startBtn');
+    const statusSection = document.getElementById('statusSection');
+    const log = document.getElementById('log');
+    const successMsg = document.getElementById('successMsg');
+
+    startBtn.addEventListener('click', () => {
+        // UI Reset
+        startBtn.disabled = true;
+        startBtn.classList.add('opacity-50');
+        statusSection.classList.remove('hidden'); // Show spinner
+        successMsg.classList.add('hidden');
+        log.innerHTML = "> Connecting to stream...<br>";
+
+        const eventSource = new EventSource('/execute-live');
+
+        eventSource.onmessage = (event) => {
+            if (event.data === "FINISHED_ALL") {
+                eventSource.close();
+                log.innerHTML += "> Scraping complete! Triggering download...<br>";
+
+                // HIDE the progress/spinner now that we are done
+                statusSection.classList.add('hidden');
+
+                // Start the file download
+                triggerFinalDownload();
+            } else {
+                // Update log with company names in real-time
+                log.innerHTML += `> Scraped: ${event.data}<br>`;
+                log.scrollTop = log.scrollHeight;
+            }
+        };
+
+        eventSource.onerror = () => {
+            eventSource.close();
+            log.innerHTML += "<span class='text-red-500'> > Connection lost.</span><br>";
+            startBtn.disabled = false;
+        };
+    });
+
+    async function triggerFinalDownload() {
+        try {
+            const response = await fetch('/execute'); // Your original CSV endpoint
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = "dse_data.xlsx";
+            document.body.appendChild(a);
+            a.click();
+
+            // Show final success
+            successMsg.classList.remove('hidden');
+        } catch (err) {
+            console.error("Download failed", err);
+        } finally {
+            startBtn.disabled = false;
+            startBtn.classList.remove('opacity-50');
+        }
+    }
+</script>
+</body>
+</html>

@@ -1,6 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 requests
 beautifulsoup4
 gspread
 oauth2client
+aiohttp
+aiofiles
